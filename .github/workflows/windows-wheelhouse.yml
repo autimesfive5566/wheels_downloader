@@ -31,7 +31,7 @@ jobs:
       - name: Download wheels
         run: |
           New-Item -ItemType Directory -Force -Path wheelhouse
-          python -m pip download --requirement requirements.txt --dest wheelhouse --only-binary=:all:
+          python -m pip wheel --requirement requirements.txt --wheel-dir wheelhouse
 
       - name: Copy requirements.txt
         run: Copy-Item requirements.txt wheelhouse\requirements.txt
