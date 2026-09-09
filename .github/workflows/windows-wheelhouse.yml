@@ -1,0 +1,44 @@
+name: Download Windows Python Wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      python_version:
+        description: "Python version (例如 3.11.9)"
+        required: true
+        default: "3.10.11"
+
+jobs:
+  download:
+    runs-on: windows-2025
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ inputs.python_version }}
+          architecture: x64
+
+      - name: Show Python version
+        run: python --version
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Download wheels
+        run: |
+          New-Item -ItemType Directory -Force -Path wheelhouse
+          python -m pip download --requirement requirements.txt --dest wheelhouse --only-binary=:all:
+
+      - name: Copy requirements.txt
+        run: Copy-Item requirements.txt wheelhouse\requirements.txt
+
+      - name: Upload wheelhouse
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-python-${{ inputs.python_version }}-wheelhouse
+          path: wheelhouse
+          retention-days: 1
