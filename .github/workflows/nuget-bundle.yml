@@ -406,8 +406,10 @@ jobs:
             "$env:GITHUB_WORKSPACE\.nuget\packages"
           $toolWorkPath =
             "$env:GITHUB_WORKSPACE\work\tool-local"
-          $manifestPath =
-            "$toolWorkPath\.config\dotnet-tools.json"
+          # dotnet new tool-manifest --output may create dotnet-tools.json
+          # directly under the output directory on current SDKs. Resolve
+          # the actual path after generation instead of assuming .config.
+          $manifestPath = $null
 
           # Local tools use NuGet's global-packages directory.
           # Point it at our clean, workflow-private directory.
@@ -434,9 +436,22 @@ jobs:
                   throw "dotnet new tool-manifest failed."
               }
 
-              if (-not (Test-Path $manifestPath)) {
-                  Write-Host "Expected manifest was not found at:"
-                  Write-Host "  $manifestPath"
+              # Different .NET SDK/template versions may place the manifest
+              # either directly in --output or under .config. Prefer the
+              # direct output observed on current GitHub runners, but support
+              # both layouts.
+              $manifestCandidates = @(
+                  (Join-Path $toolWorkPath "dotnet-tools.json"),
+                  (Join-Path $toolWorkPath ".config\dotnet-tools.json")
+              )
+
+              $manifestPath =
+                $manifestCandidates |
+                Where-Object { Test-Path $_ } |
+                Select-Object -First 1
+
+              if ([string]::IsNullOrWhiteSpace($manifestPath)) {
+                  Write-Host "Local tool manifest could not be located."
                   Write-Host ""
                   Write-Host "Files created under tool work directory:"
                   Get-ChildItem `
@@ -448,8 +463,11 @@ jobs:
                         Write-Host "  $($_.FullName)"
                     }
 
-                  throw "Local tool manifest was not created at the expected path."
+                  throw "Local tool manifest was not created."
               }
+
+              Write-Host "Local tool manifest:"
+              Write-Host "  $manifestPath"
 
               Write-Host ""
               Write-Host "Installing local tool only for dependency resolution:"
