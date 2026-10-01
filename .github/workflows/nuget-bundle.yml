@@ -424,14 +424,31 @@ jobs:
           try {
               Write-Host "Creating local tool manifest..."
 
-              dotnet new tool-manifest
+              # Explicitly control where the manifest is generated.
+              # Do not rely on dotnet template-engine context discovery.
+              dotnet new tool-manifest `
+                --output $toolWorkPath `
+                --force
 
               if ($LASTEXITCODE -ne 0) {
                   throw "dotnet new tool-manifest failed."
               }
 
               if (-not (Test-Path $manifestPath)) {
-                  throw "Local tool manifest was not created: $manifestPath"
+                  Write-Host "Expected manifest was not found at:"
+                  Write-Host "  $manifestPath"
+                  Write-Host ""
+                  Write-Host "Files created under tool work directory:"
+                  Get-ChildItem `
+                    -Path $toolWorkPath `
+                    -Recurse `
+                    -Force `
+                    -ErrorAction SilentlyContinue |
+                    ForEach-Object {
+                        Write-Host "  $($_.FullName)"
+                    }
+
+                  throw "Local tool manifest was not created at the expected path."
               }
 
               Write-Host ""
