@@ -389,11 +389,12 @@ jobs:
       # 5B. DOTNET TOOL
       #
       # A DotnetTool package cannot be restored as an ordinary
-      # PackageReference. Let the .NET CLI perform a real tool install
-      # into a temporary tool path while forcing NuGet's package cache
-      # into our clean per-run directory.
+      # PackageReference. Use a LOCAL tool manifest instead of --tool-path.
       #
-      # --framework is intentionally supplied from the workflow input.
+      # Important:
+      #   Local tools are stored in NuGet's global-packages directory.
+      #   By overriding NUGET_PACKAGES with our clean per-run directory,
+      #   we can enumerate the exact package set restored for this tool.
       # ------------------------------------------------------------
       - name: Resolve .NET Tool dependency graph
         if: env.PACKAGE_KIND == 'DotnetTool'
@@ -403,35 +404,90 @@ jobs:
 
           $packagesPath =
             "$env:GITHUB_WORKSPACE\.nuget\packages"
-          $toolPath =
-            "$env:GITHUB_WORKSPACE\tool-install"
+          $toolWorkPath =
+            "$env:GITHUB_WORKSPACE\work\tool-local"
+          $manifestPath =
+            "$toolWorkPath\.config\dotnet-tools.json"
 
-          # NuGet honors NUGET_PACKAGES for its global packages folder.
-          # Because this directory was emptied earlier, it gives us the
-          # package set restored specifically for this tool installation.
+          # Local tools use NuGet's global-packages directory.
+          # Point it at our clean, workflow-private directory.
           $env:NUGET_PACKAGES = $packagesPath
 
-          Write-Host "Installing tool only for dependency resolution:"
-          Write-Host "  ID:        $env:PACKAGE_ID"
-          Write-Host "  Version:   $env:RESOLVED_ROOT_VERSION"
-          Write-Host "  Framework: $env:TARGET_FRAMEWORK"
-          Write-Host ""
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $toolWorkPath |
+            Out-Null
 
-          dotnet tool install $env:PACKAGE_ID `
-            --tool-path $toolPath `
-            --version $env:RESOLVED_ROOT_VERSION `
-            --framework $env:TARGET_FRAMEWORK `
-            --source $env:NUGET_SOURCE `
-            --no-cache `
-            --verbosity minimal
+          Push-Location $toolWorkPath
 
-          if ($LASTEXITCODE -ne 0) {
-              throw "dotnet tool install failed."
+          try {
+              Write-Host "Creating local tool manifest..."
+
+              dotnet new tool-manifest
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw "dotnet new tool-manifest failed."
+              }
+
+              if (-not (Test-Path $manifestPath)) {
+                  throw "Local tool manifest was not created: $manifestPath"
+              }
+
+              Write-Host ""
+              Write-Host "Installing local tool only for dependency resolution:"
+              Write-Host "  ID:        $env:PACKAGE_ID"
+              Write-Host "  Version:   $env:RESOLVED_ROOT_VERSION"
+              Write-Host "  Framework: $env:TARGET_FRAMEWORK"
+              Write-Host "  Packages:  $packagesPath"
+              Write-Host "  Manifest:  $manifestPath"
+              Write-Host ""
+
+              dotnet tool install $env:PACKAGE_ID `
+                --local `
+                --tool-manifest $manifestPath `
+                --version $env:RESOLVED_ROOT_VERSION `
+                --framework $env:TARGET_FRAMEWORK `
+                --source $env:NUGET_SOURCE `
+                --no-cache `
+                --verbosity minimal
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw "dotnet tool install --local failed."
+              }
+          }
+          finally {
+              Pop-Location
           }
 
           if (-not (Test-Path $packagesPath)) {
-              throw "NuGet package cache was not created for the tool."
+              throw "NuGet global-packages directory was not created: $packagesPath"
           }
+
+          $restoredPackageDirectories =
+            @(
+              Get-ChildItem `
+                -Path $packagesPath `
+                -Directory `
+                -ErrorAction SilentlyContinue
+            )
+
+          Write-Host ""
+          Write-Host "Top-level package directories restored:"
+
+          if ($restoredPackageDirectories.Count -eq 0) {
+              Write-Host "  (none)"
+              throw (
+                "dotnet tool install succeeded, but the isolated " +
+                "NUGET_PACKAGES directory is empty."
+              )
+          }
+
+          $restoredPackageDirectories |
+            Sort-Object Name |
+            ForEach-Object {
+                Write-Host "  $($_.Name)"
+            }
 
           Write-Host ""
           Write-Host ".NET Tool dependency resolution completed."
