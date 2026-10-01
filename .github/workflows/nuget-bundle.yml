@@ -16,9 +16,9 @@ on:
         type: string
 
       target_framework:
-        description: "Target Framework (net48 = .NET Framework 4.8)"
+        description: "Target Framework (for example: net48, net8.0)"
         required: true
-        default: "net48"
+        default: "net8.0"
         type: string
 
 permissions:
@@ -33,18 +33,22 @@ jobs:
       PACKAGE_ID: ${{ inputs.package_id }}
       PACKAGE_VERSION: ${{ inputs.package_version }}
       TARGET_FRAMEWORK: ${{ inputs.target_framework }}
+      NUGET_SOURCE: https://api.nuget.org/v3/index.json
+      NUGET_FLAT_CONTAINER: https://api.nuget.org/v3-flatcontainer
 
     steps:
-
       # ------------------------------------------------------------
       # 1. Show environment information
       # ------------------------------------------------------------
       - name: Show .NET environment
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           Write-Host "Package:          $env:PACKAGE_ID"
           Write-Host "Version:          $env:PACKAGE_VERSION"
           Write-Host "Target Framework: $env:TARGET_FRAMEWORK"
+          Write-Host "NuGet source:     $env:NUGET_SOURCE"
           Write-Host ""
 
           dotnet --info
@@ -52,9 +56,9 @@ jobs:
       # ------------------------------------------------------------
       # 2. Validate user inputs
       #
-      # Inputs are inserted into an XML project later, so restrict them
-      # to characters that are valid for normal NuGet IDs / versions /
-      # target framework monikers.
+      # These values are later used in URLs, paths, command arguments,
+      # and (for normal packages) XML. Restrict them to characters used
+      # by ordinary NuGet IDs / versions / target-framework monikers.
       # ------------------------------------------------------------
       - name: Validate inputs
         shell: pwsh
@@ -76,24 +80,241 @@ jobs:
           Write-Host "Inputs are valid."
 
       # ------------------------------------------------------------
-      # 3. Create a temporary SDK-style project
+      # 3. Prepare clean working directories
       #
-      # Example:
-      #   TargetFramework = net48
-      #
-      # The exact package version is enclosed in [ ] so NuGet cannot
-      # silently choose a newer version of the root package.
+      # A private NUGET_PACKAGES directory is important for DotnetTool.
+      # It lets us enumerate exactly the packages restored for this run,
+      # without mixing them with packages preinstalled on the runner.
       # ------------------------------------------------------------
-      - name: Create resolver project
+      - name: Prepare working directories
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path "$env:GITHUB_WORKSPACE\work" |
-            Out-Null
+          $paths = @(
+              "$env:GITHUB_WORKSPACE\work",
+              "$env:GITHUB_WORKSPACE\.nuget\packages",
+              "$env:GITHUB_WORKSPACE\tool-install",
+              "$env:GITHUB_WORKSPACE\root-package",
+              "$env:GITHUB_WORKSPACE\nupkgs"
+          )
+
+          foreach ($path in $paths) {
+              if (Test-Path $path) {
+                  Remove-Item $path -Recurse -Force
+              }
+
+              New-Item -ItemType Directory -Force -Path $path |
+                Out-Null
+          }
+
+          Write-Host "Working directories prepared."
+
+      # ------------------------------------------------------------
+      # 4. Verify the exact version and detect package type
+      #
+      # We first query the NuGet flat-container version index, then
+      # download only the requested root package and inspect its .nuspec.
+      #
+      # Supported roots:
+      #   - Dependency  -> ordinary NuGet package / PackageReference
+      #   - DotnetTool  -> .NET tool / dotnet tool install
+      #
+      # If a package has multiple package types and one is DotnetTool,
+      # we treat it as a tool.
+      # ------------------------------------------------------------
+      - name: Detect package type
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $flatId = $env:PACKAGE_ID.ToLowerInvariant()
+          $indexUrl = "$env:NUGET_FLAT_CONTAINER/$flatId/index.json"
+
+          Write-Host "Checking package versions:"
+          Write-Host "  $indexUrl"
+
+          try {
+              $index = Invoke-RestMethod `
+                -Uri $indexUrl `
+                -MaximumRetryCount 5 `
+                -RetryIntervalSec 2
+          }
+          catch {
+              throw "Unable to read the NuGet version index for '$env:PACKAGE_ID'. $($_.Exception.Message)"
+          }
+
+          $availableVersions = @($index.versions)
+
+          if ($availableVersions.Count -eq 0) {
+              throw "NuGet returned no versions for package '$env:PACKAGE_ID'."
+          }
+
+          # Exact version only. Comparison is case-insensitive so versions
+          # containing prerelease labels are still convenient to enter.
+          $resolvedVersion =
+            $availableVersions |
+            Where-Object {
+                [string]::Equals(
+                    [string]$_,
+                    $env:PACKAGE_VERSION,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            } |
+            Select-Object -First 1
+
+          if ([string]::IsNullOrWhiteSpace([string]$resolvedVersion)) {
+              Write-Host ""
+              Write-Host "Requested version does not exist:"
+              Write-Host "  $env:PACKAGE_ID $env:PACKAGE_VERSION"
+              Write-Host ""
+              Write-Host "Latest versions available on NuGet.org:"
+
+              $availableVersions |
+                Select-Object -Last 10 |
+                Sort-Object -Descending |
+                ForEach-Object {
+                    Write-Host "  $_"
+                }
+
+              throw "Exact package version was not found on NuGet.org."
+          }
+
+          $resolvedVersion = [string]$resolvedVersion
+          $flatVersion = $resolvedVersion.ToLowerInvariant()
+
+          $rootFileName = "$flatId.$flatVersion.nupkg"
+          $rootUrl =
+            "$env:NUGET_FLAT_CONTAINER/$flatId/$flatVersion/$rootFileName"
+          $rootPath =
+            "$env:GITHUB_WORKSPACE\root-package\$rootFileName"
+
+          Write-Host ""
+          Write-Host "Downloading root package for metadata inspection:"
+          Write-Host "  $rootUrl"
+
+          Invoke-WebRequest `
+            -Uri $rootUrl `
+            -OutFile $rootPath `
+            -MaximumRetryCount 5 `
+            -RetryIntervalSec 2
+
+          if (-not (Test-Path $rootPath)) {
+              throw "Root package download failed."
+          }
+
+          if ((Get-Item $rootPath).Length -eq 0) {
+              throw "Downloaded root package is empty."
+          }
+
+          $zip =
+            [System.IO.Compression.ZipFile]::OpenRead($rootPath)
+
+          try {
+              $nuspecEntry =
+                $zip.Entries |
+                Where-Object {
+                    $_.FullName -match '^[^/\\]+\.nuspec$'
+                } |
+                Select-Object -First 1
+
+              if ($null -eq $nuspecEntry) {
+                  throw "The package does not contain a root .nuspec file."
+              }
+
+              $reader =
+                [System.IO.StreamReader]::new(
+                    $nuspecEntry.Open(),
+                    [System.Text.Encoding]::UTF8,
+                    $true
+                )
+
+              try {
+                  $nuspecText = $reader.ReadToEnd()
+              }
+              finally {
+                  $reader.Dispose()
+              }
+          }
+          finally {
+              $zip.Dispose()
+          }
+
+          [xml]$nuspec = $nuspecText
+
+          $packageTypeNodes =
+            @(
+              $nuspec.SelectNodes(
+                "//*[local-name()='packageTypes']/*[local-name()='packageType']"
+              )
+            )
+
+          $packageTypes = @()
+
+          foreach ($node in $packageTypeNodes) {
+              $name = [string]$node.GetAttribute("name")
+
+              if (-not [string]::IsNullOrWhiteSpace($name)) {
+                  $packageTypes += $name
+              }
+          }
+
+          if ($packageTypes -contains "DotnetTool") {
+              $packageKind = "DotnetTool"
+          }
+          elseif (
+              $packageTypes.Count -eq 0 -or
+              $packageTypes -contains "Dependency"
+          ) {
+              $packageKind = "Dependency"
+          }
+          else {
+              $displayTypes = $packageTypes -join ", "
+              throw "Unsupported root package type(s): $displayTypes"
+          }
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "Resolved root package"
+          Write-Host "========================================"
+          Write-Host "ID:             $env:PACKAGE_ID"
+          Write-Host "Version:        $resolvedVersion"
+          Write-Host "Package kind:   $packageKind"
+
+          if ($packageTypes.Count -gt 0) {
+              Write-Host "Package types:  $($packageTypes -join ', ')"
+          }
+          else {
+              Write-Host "Package types:  (not declared; treated as Dependency)"
+          }
+
+          Write-Host "========================================"
+
+          "RESOLVED_ROOT_VERSION=$resolvedVersion" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          "PACKAGE_KIND=$packageKind" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+      # ------------------------------------------------------------
+      # 5A. NORMAL PACKAGE
+      #
+      # Create an SDK-style resolver project and let NuGet calculate
+      # the complete dependency graph for the requested TFM.
+      # ------------------------------------------------------------
+      - name: Create resolver project for normal package
+        if: env.PACKAGE_KIND == 'Dependency'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
 
           $project = @"
           <Project Sdk="Microsoft.NET.Sdk">
@@ -101,60 +322,48 @@ jobs:
             <PropertyGroup>
               <TargetFramework>$env:TARGET_FRAMEWORK</TargetFramework>
 
-              <!--
-                Important for .NET Framework targets such as net48.
-                GitHub's Windows runner contains the required
-                .NET Framework targeting packs.
-              -->
+              <!-- Required when targeting .NET Framework on this runner. -->
               <EnableWindowsTargeting>true</EnableWindowsTargeting>
 
-              <!-- Only resolve packages from nuget.org -->
-              <RestoreSources>https://api.nuget.org/v3/index.json</RestoreSources>
+              <!-- Only resolve from nuget.org. -->
+              <RestoreSources>$env:NUGET_SOURCE</RestoreSources>
             </PropertyGroup>
 
             <ItemGroup>
               <PackageReference
                 Include="$env:PACKAGE_ID"
-                Version="[$env:PACKAGE_VERSION]" />
+                Version="[$env:RESOLVED_ROOT_VERSION]" />
             </ItemGroup>
 
           </Project>
           "@
 
-          $projectPath = "$env:GITHUB_WORKSPACE\work\Resolver.csproj"
+          $projectPath =
+            "$env:GITHUB_WORKSPACE\work\Resolver.csproj"
 
           Set-Content `
             -Path $projectPath `
             -Value $project `
             -Encoding UTF8
 
-          Write-Host ""
           Write-Host "Generated Resolver.csproj:"
           Write-Host "----------------------------------------"
           Get-Content $projectPath
           Write-Host "----------------------------------------"
 
-      # ------------------------------------------------------------
-      # 4. Let the real NuGet resolver calculate the complete graph
-      #
-      # project.assets.json will contain:
-      #
-      #   root package
-      #     -> direct dependency
-      #        -> transitive dependency
-      #           -> transitive dependency
-      #              ...
-      #
-      # The actual packages are restored to a temporary directory,
-      # but these extracted files will NOT be included in the output.
-      # ------------------------------------------------------------
-      - name: Resolve complete dependency graph
+      - name: Resolve normal package dependency graph
+        if: env.PACKAGE_KIND == 'Dependency'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $projectPath = "$env:GITHUB_WORKSPACE\work\Resolver.csproj"
-          $packagesPath = "$env:GITHUB_WORKSPACE\.nuget\packages"
+          $projectPath =
+            "$env:GITHUB_WORKSPACE\work\Resolver.csproj"
+          $packagesPath =
+            "$env:GITHUB_WORKSPACE\.nuget\packages"
+
+          # Keep NuGet's global package folder isolated to this workflow.
+          $env:NUGET_PACKAGES = $packagesPath
 
           dotnet restore $projectPath `
             --packages $packagesPath `
@@ -174,79 +383,238 @@ jobs:
           }
 
           Write-Host ""
-          Write-Host "NuGet dependency resolution completed."
+          Write-Host "Normal NuGet dependency resolution completed."
 
       # ------------------------------------------------------------
-      # 5. Read project.assets.json
+      # 5B. DOTNET TOOL
       #
-      # We use NuGet's resolved graph rather than recursively parsing
-      # .nuspec files ourselves. This means version conflicts and
-      # TargetFramework selection have already been resolved by NuGet.
+      # A DotnetTool package cannot be restored as an ordinary
+      # PackageReference. Let the .NET CLI perform a real tool install
+      # into a temporary tool path while forcing NuGet's package cache
+      # into our clean per-run directory.
+      #
+      # --framework is intentionally supplied from the workflow input.
       # ------------------------------------------------------------
-      - name: Read resolved package list
-        id: packages
+      - name: Resolve .NET Tool dependency graph
+        if: env.PACKAGE_KIND == 'DotnetTool'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $assetsPath =
-            "$env:GITHUB_WORKSPACE\work\obj\project.assets.json"
+          $packagesPath =
+            "$env:GITHUB_WORKSPACE\.nuget\packages"
+          $toolPath =
+            "$env:GITHUB_WORKSPACE\tool-install"
 
-          $assets =
-            Get-Content $assetsPath -Raw |
-            ConvertFrom-Json
+          # NuGet honors NUGET_PACKAGES for its global packages folder.
+          # Because this directory was emptied earlier, it gives us the
+          # package set restored specifically for this tool installation.
+          $env:NUGET_PACKAGES = $packagesPath
+
+          Write-Host "Installing tool only for dependency resolution:"
+          Write-Host "  ID:        $env:PACKAGE_ID"
+          Write-Host "  Version:   $env:RESOLVED_ROOT_VERSION"
+          Write-Host "  Framework: $env:TARGET_FRAMEWORK"
+          Write-Host ""
+
+          dotnet tool install $env:PACKAGE_ID `
+            --tool-path $toolPath `
+            --version $env:RESOLVED_ROOT_VERSION `
+            --framework $env:TARGET_FRAMEWORK `
+            --source $env:NUGET_SOURCE `
+            --no-cache `
+            --verbosity minimal
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "dotnet tool install failed."
+          }
+
+          if (-not (Test-Path $packagesPath)) {
+              throw "NuGet package cache was not created for the tool."
+          }
+
+          Write-Host ""
+          Write-Host ".NET Tool dependency resolution completed."
+
+      # ------------------------------------------------------------
+      # 6. Build one unified resolved package list
+      #
+      # Normal packages:
+      #   Read NuGet's project.assets.json.
+      #
+      # DotnetTool packages:
+      #   Enumerate the isolated NUGET_PACKAGES directory populated by
+      #   dotnet tool install. The directory layout is:
+      #
+      #     <package-id>/<version>/...
+      # ------------------------------------------------------------
+      - name: Read resolved package list
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
 
           $packages = @()
 
-          foreach ($property in $assets.libraries.PSObject.Properties) {
+          if ($env:PACKAGE_KIND -eq "Dependency") {
 
-              if ($property.Value.type -ne "package") {
-                  continue
+              $assetsPath =
+                "$env:GITHUB_WORKSPACE\work\obj\project.assets.json"
+
+              $assets =
+                Get-Content $assetsPath -Raw |
+                ConvertFrom-Json
+
+              foreach ($property in $assets.libraries.PSObject.Properties) {
+
+                  if ($property.Value.type -ne "package") {
+                      continue
+                  }
+
+                  $key = $property.Name
+                  $slashIndex = $key.LastIndexOf("/")
+
+                  if ($slashIndex -lt 1) {
+                      throw "Unexpected package key: $key"
+                  }
+
+                  $id =
+                    $key.Substring(0, $slashIndex)
+
+                  $version =
+                    $key.Substring($slashIndex + 1)
+
+                  $packagePath =
+                    [string]$property.Value.path
+
+                  if ([string]::IsNullOrWhiteSpace($packagePath)) {
+                      throw "Package path is missing for: $key"
+                  }
+
+                  $packages += [PSCustomObject]@{
+                      Id      = $id
+                      Version = $version
+                      Path    = $packagePath
+                  }
               }
+          }
+          elseif ($env:PACKAGE_KIND -eq "DotnetTool") {
 
-              $key = $property.Name
+              $packagesRoot =
+                "$env:GITHUB_WORKSPACE\.nuget\packages"
 
-              # Example key:
-              #
-              #   Newtonsoft.Json/13.0.4
-              #
-              $slashIndex = $key.LastIndexOf("/")
+              $packageDirectories =
+                Get-ChildItem `
+                  -Path $packagesRoot `
+                  -Directory
 
-              if ($slashIndex -lt 1) {
-                  throw "Unexpected package key: $key"
+              foreach ($packageDirectory in $packageDirectories) {
+
+                  $versionDirectories =
+                    Get-ChildItem `
+                      -Path $packageDirectory.FullName `
+                      -Directory
+
+                  foreach ($versionDirectory in $versionDirectories) {
+
+                      $nuspecFile =
+                        Get-ChildItem `
+                          -Path $versionDirectory.FullName `
+                          -Filter "*.nuspec" `
+                          -File |
+                        Select-Object -First 1
+
+                      $id = $packageDirectory.Name
+                      $version = $versionDirectory.Name
+
+                      # Prefer the original casing/value stored in the nuspec
+                      # for display, while keeping the directory-based Path for
+                      # flat-container download URLs.
+                      if ($null -ne $nuspecFile) {
+                          try {
+                              [xml]$nuspec =
+                                Get-Content $nuspecFile.FullName -Raw
+
+                              $idNode =
+                                $nuspec.SelectSingleNode(
+                                  "//*[local-name()='metadata']/*[local-name()='id']"
+                                )
+
+                              $versionNode =
+                                $nuspec.SelectSingleNode(
+                                  "//*[local-name()='metadata']/*[local-name()='version']"
+                                )
+
+                              if (
+                                  $null -ne $idNode -and
+                                  -not [string]::IsNullOrWhiteSpace($idNode.InnerText)
+                              ) {
+                                  $id = $idNode.InnerText
+                              }
+
+                              if (
+                                  $null -ne $versionNode -and
+                                  -not [string]::IsNullOrWhiteSpace($versionNode.InnerText)
+                              ) {
+                                  $version = $versionNode.InnerText
+                              }
+                          }
+                          catch {
+                              Write-Warning (
+                                "Unable to read nuspec metadata from: " +
+                                $nuspecFile.FullName
+                              )
+                          }
+                      }
+
+                      $packagePath =
+                        "$($packageDirectory.Name)/$($versionDirectory.Name)"
+
+                      $packages += [PSCustomObject]@{
+                          Id      = $id
+                          Version = $version
+                          Path    = $packagePath
+                      }
+                  }
               }
-
-              $id =
-                $key.Substring(
-                  0,
-                  $slashIndex
-                )
-
-              $version =
-                $key.Substring(
-                  $slashIndex + 1
-                )
-
-              $packagePath =
-                [string]$property.Value.path
-
-              if ([string]::IsNullOrWhiteSpace($packagePath)) {
-                  throw "Package path is missing for: $key"
-              }
-
-              $packages += [PSCustomObject]@{
-                  Id      = $id
-                  Version = $version
-                  Path    = $packagePath
-              }
+          }
+          else {
+              throw "Unexpected PACKAGE_KIND: $env:PACKAGE_KIND"
           }
 
           $packages =
-            $packages |
-            Sort-Object Path -Unique
+            @(
+              $packages |
+              Sort-Object Path -Unique
+            )
 
           if ($packages.Count -eq 0) {
               throw "No NuGet packages were resolved."
+          }
+
+          # Ensure the requested root package is present in the result.
+          $rootFound =
+            $packages |
+            Where-Object {
+                [string]::Equals(
+                    [string]$_.Id,
+                    $env:PACKAGE_ID,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                ) -and
+                [string]::Equals(
+                    [string]$_.Version,
+                    $env:RESOLVED_ROOT_VERSION,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            } |
+            Select-Object -First 1
+
+          if ($null -eq $rootFound) {
+              Write-Host "Resolved package list:"
+              $packages |
+                Sort-Object Id, Version |
+                Format-Table Id, Version, Path -AutoSize
+
+              throw "The requested root package is missing from the resolved package list."
           }
 
           Write-Host ""
@@ -254,15 +622,14 @@ jobs:
           Write-Host "========================================"
 
           $packages |
-            Sort-Object Id |
+            Sort-Object Id, Version |
             Format-Table Id, Version -AutoSize
 
           Write-Host ""
+          Write-Host "Root package kind:   $env:PACKAGE_KIND"
           Write-Host "Total package count: $($packages.Count)"
           Write-Host ""
 
-          # Save package information temporarily for the next step.
-          # This file is NOT placed in the final ZIP.
           $packages |
             ConvertTo-Json -Depth 5 |
             Set-Content `
@@ -270,66 +637,53 @@ jobs:
               -Encoding UTF8
 
       # ------------------------------------------------------------
-      # 6. Download the ORIGINAL .nupkg files from nuget.org
+      # 7. Download the ORIGINAL .nupkg files from nuget.org
       #
-      # NuGet's global package cache mainly contains extracted package
-      # contents. Therefore we explicitly download each original nupkg
-      # from NuGet's official flat-container API.
+      # The NuGet global package folder contains extracted contents.
+      # For the final offline bundle we explicitly fetch each original
+      # nupkg from NuGet's official flat-container API.
       # ------------------------------------------------------------
-      - name: Download all nupkg files
+      - name: Download all original nupkg files
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
           $packageListPath =
             "$env:GITHUB_WORKSPACE\resolved-packages.json"
-
           $outputDirectory =
             "$env:GITHUB_WORKSPACE\nupkgs"
-
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path $outputDirectory |
-            Out-Null
 
           $packages =
             Get-Content $packageListPath -Raw |
             ConvertFrom-Json
 
           # ConvertFrom-Json returns a single object rather than an
-          # array if there is only one package.
+          # array when the JSON contains only one package.
           $packages = @($packages)
-
-          $baseUrl =
-            "https://api.nuget.org/v3-flatcontainer"
 
           $downloaded = 0
 
           foreach ($package in $packages) {
 
               $packagePath =
-                [string]$package.Path
+                ([string]$package.Path).Replace("\\", "/").ToLowerInvariant()
 
-              # Example:
-              #
-              # packagePath:
-              #   newtonsoft.json/13.0.4
-              #
-              # fileName:
-              #   newtonsoft.json.13.0.4.nupkg
+              if ($packagePath -notmatch '^[a-z0-9_.-]+/[a-z0-9.+-]+$') {
+                  throw "Unexpected flat-container package path: $packagePath"
+              }
+
+              $parts = $packagePath.Split('/')
+              $flatId = $parts[0]
+              $flatVersion = $parts[1]
 
               $fileName =
-                ($packagePath -replace '/', '.') +
-                ".nupkg"
+                "$flatId.$flatVersion.nupkg"
 
               $url =
-                "$baseUrl/$packagePath/$fileName"
+                "$env:NUGET_FLAT_CONTAINER/$flatId/$flatVersion/$fileName"
 
               $destination =
-                Join-Path `
-                  $outputDirectory `
-                  $fileName
+                Join-Path $outputDirectory $fileName
 
               Write-Host ""
               Write-Host "Downloading:"
@@ -364,7 +718,7 @@ jobs:
           }
 
       # ------------------------------------------------------------
-      # 7. Verify that the output directory contains ONLY .nupkg files
+      # 8. Verify that the final directory contains ONLY .nupkg files
       # ------------------------------------------------------------
       - name: Verify output
         shell: pwsh
@@ -375,22 +729,27 @@ jobs:
             "$env:GITHUB_WORKSPACE\nupkgs"
 
           $allFiles =
-            Get-ChildItem `
-              -Path $outputDirectory `
-              -File
+            @(
+              Get-ChildItem `
+                -Path $outputDirectory `
+                -File
+            )
 
           if ($allFiles.Count -eq 0) {
               throw "No files found in output directory."
           }
 
           $invalidFiles =
-            $allFiles |
-            Where-Object {
-                $_.Extension -ne ".nupkg"
-            }
+            @(
+              $allFiles |
+              Where-Object {
+                  $_.Extension -ne ".nupkg"
+              }
+            )
 
           if ($invalidFiles.Count -gt 0) {
               Write-Host "Unexpected files:"
+
               $invalidFiles |
                 ForEach-Object {
                     Write-Host $_.FullName
@@ -413,15 +772,10 @@ jobs:
           Write-Host "Total: $($allFiles.Count) .nupkg files"
 
       # ------------------------------------------------------------
-      # 8. Create the ZIP ourselves
+      # 9. Create the ZIP ourselves
       #
-      # The ZIP root contains ONLY:
-      #
-      #   package1.x.y.z.nupkg
-      #   package2.x.y.z.nupkg
-      #   package3.x.y.z.nupkg
-      #
-      # There is NO nested "nupkgs" directory.
+      # ZIP root contains only .nupkg files. There is no nested
+      # "nupkgs" directory.
       # ------------------------------------------------------------
       - name: Create ZIP
         shell: pwsh
@@ -432,19 +786,17 @@ jobs:
             "$env:GITHUB_WORKSPACE\nupkgs"
 
           $zipName =
-            "NuGet-$env:PACKAGE_ID-$env:PACKAGE_VERSION-$env:TARGET_FRAMEWORK.zip"
+            "NuGet-$env:PACKAGE_ID-$env:RESOLVED_ROOT_VERSION-$env:TARGET_FRAMEWORK.zip"
 
           $zipPath =
-            Join-Path `
-              $env:GITHUB_WORKSPACE `
-              $zipName
+            Join-Path $env:GITHUB_WORKSPACE $zipName
 
           if (Test-Path $zipPath) {
               Remove-Item $zipPath -Force
           }
 
-          # .nupkg is already a ZIP-based format, so recompressing it
-          # gives little benefit. NoCompression is faster.
+          # .nupkg is already ZIP-based, so recompressing gives little
+          # benefit. NoCompression is substantially faster here.
           Compress-Archive `
             -Path "$outputDirectory\*.nupkg" `
             -DestinationPath $zipPath `
@@ -462,7 +814,6 @@ jobs:
           Write-Host "ZIP size:"
           Write-Host "$([Math]::Round((Get-Item $zipPath).Length / 1MB, 2)) MB"
 
-          # Make the ZIP path available to the next Action step.
           "ZIP_PATH=$zipPath" |
             Out-File `
               -FilePath $env:GITHUB_ENV `
@@ -470,11 +821,10 @@ jobs:
               -Append
 
       # ------------------------------------------------------------
-      # 9. Upload the ZIP directly
+      # 10. Upload the ZIP directly
       #
-      # upload-artifact v7 supports direct upload of one file.
-      # archive:false prevents GitHub from wrapping our ZIP in another
-      # artifact ZIP.
+      # upload-artifact v7 with archive:false uploads this one ZIP
+      # as-is instead of wrapping it in a second artifact ZIP.
       # ------------------------------------------------------------
       - name: Upload NuGet ZIP
         uses: actions/upload-artifact@v7
