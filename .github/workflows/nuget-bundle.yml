@@ -16,7 +16,7 @@ on:
         type: string
 
       target_framework:
-        description: "Target Framework (for example: net48, net8.0)"
+        description: "Target Framework for normal packages (for example: net48, net8.0)"
         required: true
         default: "net8.0"
         type: string
@@ -395,6 +395,11 @@ jobs:
       #   Local tools are stored in NuGet's global-packages directory.
       #   By overriding NUGET_PACKAGES with our clean per-run directory,
       #   we can enumerate the exact package set restored for this tool.
+      #
+      #   Do NOT pass --framework together with --local here. GitHub-hosted
+      #   runners can reject that combination with:
+      #     The local option(--local) does not support the framework option.
+      #   The SDK will select the appropriate framework for the tool package.
       # ------------------------------------------------------------
       - name: Resolve .NET Tool dependency graph
         if: env.PACKAGE_KIND == 'DotnetTool'
@@ -473,7 +478,7 @@ jobs:
               Write-Host "Installing local tool only for dependency resolution:"
               Write-Host "  ID:        $env:PACKAGE_ID"
               Write-Host "  Version:   $env:RESOLVED_ROOT_VERSION"
-              Write-Host "  Framework: $env:TARGET_FRAMEWORK"
+              Write-Host "  Framework: selected automatically by the .NET SDK"
               Write-Host "  Packages:  $packagesPath"
               Write-Host "  Manifest:  $manifestPath"
               Write-Host ""
@@ -482,7 +487,6 @@ jobs:
                 --local `
                 --tool-manifest $manifestPath `
                 --version $env:RESOLVED_ROOT_VERSION `
-                --framework $env:TARGET_FRAMEWORK `
                 --source $env:NUGET_SOURCE `
                 --no-cache `
                 --verbosity minimal
