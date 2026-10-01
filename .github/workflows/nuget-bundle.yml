@@ -54,28 +54,59 @@ jobs:
           dotnet --info
 
       # ------------------------------------------------------------
-      # 2. Validate user inputs
+      # 2. Normalize and validate user inputs
       #
-      # These values are later used in URLs, paths, command arguments,
-      # and (for normal packages) XML. Restrict them to characters used
-      # by ordinary NuGet IDs / versions / target-framework monikers.
+      # GitHub workflow_dispatch text inputs can accidentally contain
+      # leading/trailing whitespace. Trim them first, validate the cleaned
+      # values, then write the normalized values back to GITHUB_ENV so every
+      # later step uses the cleaned versions.
       # ------------------------------------------------------------
-      - name: Validate inputs
+      - name: Normalize and validate inputs
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          if ($env:PACKAGE_ID -notmatch '^[A-Za-z0-9_.-]+$') {
-              throw "Invalid Package ID: $env:PACKAGE_ID"
+          $packageId = ([string]$env:PACKAGE_ID).Trim()
+          $packageVersion = ([string]$env:PACKAGE_VERSION).Trim()
+          $targetFramework = ([string]$env:TARGET_FRAMEWORK).Trim()
+
+          if ([string]::IsNullOrWhiteSpace($packageId)) {
+              throw "Package ID cannot be empty."
           }
 
-          if ($env:PACKAGE_VERSION -notmatch '^[A-Za-z0-9.+-]+$') {
-              throw "Invalid package version: $env:PACKAGE_VERSION"
+          if ([string]::IsNullOrWhiteSpace($packageVersion)) {
+              throw "Package version cannot be empty."
           }
 
-          if ($env:TARGET_FRAMEWORK -notmatch '^[A-Za-z0-9_.-]+$') {
-              throw "Invalid Target Framework: $env:TARGET_FRAMEWORK"
+          if ([string]::IsNullOrWhiteSpace($targetFramework)) {
+              throw "Target Framework cannot be empty."
           }
+
+          if ($packageId -notmatch '^[A-Za-z0-9_.-]+$') {
+              throw "Invalid Package ID after trimming: '$packageId'"
+          }
+
+          if ($packageVersion -notmatch '^[A-Za-z0-9.+-]+$') {
+              throw "Invalid package version after trimming: '$packageVersion'"
+          }
+
+          if ($targetFramework -notmatch '^[A-Za-z0-9_.-]+$') {
+              throw "Invalid Target Framework after trimming: '$targetFramework'"
+          }
+
+          Write-Host "Normalized inputs:"
+          Write-Host "  Package ID:       '$packageId'"
+          Write-Host "  Package version:  '$packageVersion'"
+          Write-Host "  Target framework: '$targetFramework'"
+
+          "PACKAGE_ID=$packageId" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          "PACKAGE_VERSION=$packageVersion" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          "TARGET_FRAMEWORK=$targetFramework" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
           Write-Host "Inputs are valid."
 
